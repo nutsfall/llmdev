@@ -1,5 +1,12 @@
 import os
 from dotenv import load_dotenv
+import tiktoken
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain.tools.retriever import create_retriever_tool
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph
@@ -28,6 +35,63 @@ graph = None
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
+# ===== インデックスの構築 =====
+def create_index(persist_directory, embedding_model):
+    # 実行中のスクリプトのパスを取得
+    current_script_path = os.path.abspath(__file__)
+    # 実行中のスクリプトが存在するディレクトリを取得
+    current_directory = os.path.dirname(current_script_path)
+
+    # テキストファイルを読込
+    loader = DirectoryLoader(f'{current_directory}/data/pdf', glob="./*.pdf",   loader_cls=PyPDFLoader)
+    documents = loader.load()
+
+    # チャンクに分割
+    encoding_name = tiktoken.encoding_for_model(MODEL_NAME).name
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(encoding_name)
+    texts = text_splitter.split_documents(documents)
+
+    # 新規にIndexを構築
+    db = Chroma.from_documents(texts, embedding_model, persist_directory=persist_directory)
+    return db
+
+def define_tools():
+    # 実行中のスクリプトのパスを取得
+    current_script_path = os.path.abspath(__file__)
+    # 実行中のスクリプトが存在するディレクトリを取得
+    current_directory = os.path.dirname(current_script_path)
+
+    # インデックスの保存先
+    persist_directory = f'{current_directory}/chroma_db'
+    # エンベディングモデル
+    embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    if os.path.exists(persist_directory):
+        try:
+            # ストレージから復元
+            db = Chroma(persist_directory=persist_directory, embedding_function=embedding_model)
+            print("既存のインデックスを復元しました。")
+        except Exception as e:
+            print(f"インデックスの復元に失敗しました: {e}")
+            db = create_index(persist_directory, embedding_model)
+    else:
+        print(f"インデックスを新規作成します。")
+        db = create_index(persist_directory, embedding_model)
+
+    # Retrieverの作成
+    retriever = db.as_retriever()
+
+    retriever_tool = create_retriever_tool(
+        retriever,
+        "retrieve_company_rules",
+        "Search and return company rules",
+    )
+
+    # Web検索ツール
+    tavily_tool = TavilySearchResults(max_results=2)
+
+    return [retriever_tool, tavily_tool]
+
 # ===== グラフの構築 =====
 def build_graph(model_name, memory):
     """
@@ -37,9 +101,8 @@ def build_graph(model_name, memory):
     # グラフのインスタンスを作成
     graph_builder = StateGraph(State)
 
-    # ツールノードを作成（TavilySearchResultsを使用）
-    tavily_tool = TavilySearchResults(max_results=2)
-    tools = [tavily_tool]
+    # ツールノードの作成
+    tools = define_tools()
     tool_node = ToolNode(tools)
     graph_builder.add_node("tools", tool_node)
 
@@ -64,19 +127,19 @@ def build_graph(model_name, memory):
     return graph_builder.compile(checkpointer=memory)
 
 # ===== グラフを実行する関数 =====
-def stream_graph_updates(graph: StateGraph, user_message: str):
+def stream_graph_updates(graph: StateGraph, user_message: str, thread_id):
     """
     ユーザーからのメッセージを元に、グラフを実行し、チャットボットの応答をストリーミングします。
     """
     response = graph.invoke(
         {"messages": [("user", user_message)]},
-        {"configurable": {"thread_id": "1"}},
+        {"configurable": {"thread_id": thread_id}},
         stream_mode="values"
     )
     return response["messages"][-1].content
 
 # ===== 応答を返す関数 =====
-def get_bot_response(user_message, memory):
+def get_bot_response(user_message, memory, thread_id):
     """
     ユーザーのメッセージに基づき、ボットの応答を取得します。
     初回の場合、新しいグラフを作成します。
@@ -87,21 +150,21 @@ def get_bot_response(user_message, memory):
         graph = build_graph(MODEL_NAME, memory)
 
     # グラフを実行してボットの応答を取得
-    return stream_graph_updates(graph, user_message)
+    return stream_graph_updates(graph, user_message, thread_id)
 
 # ===== メッセージの一覧を取得する関数 =====
-def get_messages_list(memory):
+def get_messages_list(memory, thread_id):
     """
     メモリからメッセージ一覧を取得し、ユーザーとボットのメッセージを分類します。
     """
     messages = []
     # メモリからメッセージを取得
-    memories = memory.get({"configurable": {"thread_id": "1"}})['channel_values']['messages']
+    memories = memory.get({"configurable": {"thread_id": thread_id}})['channel_values']['messages']
     for message in memories:
         if isinstance(message, HumanMessage):
             # ユーザーからのメッセージ
-            messages.append({'class': 'user-message', 'text': message.content})
+            messages.append({'class': 'user-message', 'text': message.content.replace('\n', '<br>')})
         elif isinstance(message, AIMessage) and message.content != "":
             # ボットからのメッセージ（最終回答）
-            messages.append({'class': 'bot-message', 'text': message.content})
+            messages.append({'class': 'bot-message', 'text': message.content.replace('\n', '<br>')})
     return messages
